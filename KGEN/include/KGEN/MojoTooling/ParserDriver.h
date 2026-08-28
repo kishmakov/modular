@@ -86,6 +86,11 @@ public:
   /// to the list of fields within the struct passed to the expression
   /// function.
   virtual bool shouldPersistVariable(StringRef name, Type type) = 0;
+
+  /// Query whether a persisted variable is the result of the expression. A
+  /// result is backed directly by LLDB-provided storage instead of the
+  /// pointer-to-pointer storage used for persistent REPL variables.
+  virtual bool isResultVariable(StringRef name) { return false; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -297,10 +302,16 @@ public:
   ///   def replExprFn(context&: ReplContext):
   ///      print(context.a.load().load())
   ///
+  /// The first `numProgramVariables` entries are variables from a debugger
+  /// frame. They are materialized directly as `Pointer[T]`; the remaining
+  /// persistent REPL variables use the `Pointer[Pointer[T]]` layout shown
+  /// above.
+  ///
   ParsedREPLExpr
   parseREPLExpression(MojoParserREPLListener &listener, unsigned exprFileId,
                       StringRef replExprFnName,
-                      ArrayRef<std::pair<StringRef, Type>> replVariables);
+                      ArrayRef<std::pair<StringRef, Type>> replVariables,
+                      unsigned numProgramVariables = 0);
 
   /// The following methods allow for interacting with the parser for REPL
   /// like expressions, i.e., in environments like Jupyter notebooks.
@@ -319,7 +330,8 @@ public:
   parseREPLExpression(MojoParserREPLListener &listener, unsigned exprFileId,
                       StringRef exprText, StringRef replExprFnName,
                       ArrayRef<std::pair<StringRef, Type>> replVariables,
-                      MojoASTDeclRef prevReplExpr, bool parseForLSP);
+                      MojoASTDeclRef prevReplExpr, bool parseForLSP,
+                      unsigned numProgramVariables = 0);
 
   /// Return the code completion results for the given REPL expression.
   std::vector<KGEN::Mojo::CodeCompletionResult> codeCompleteREPLExpression(

@@ -6,9 +6,15 @@ tests.
 
 ## llvm-lit tests
 
-These tests assert on the LLDB CLI's output and should print variables using
-the `frame variable` (aka `v`) command. `expr` (aka `p`) should be avoided
-because it often tries to JIT, which we don't support yet.
+These tests assert on the LLDB CLI's output. Prefer `frame variable` (aka `v`)
+for inspecting a variable: it reads the value straight out of the process
+without compiling anything, so it is faster and it isolates the DWARF and
+formatter behaviour that these tests are usually about.
+
+Use `expression` (aka `p`) when the JIT path itself is what is under test, as
+in `expression.lldb`. Note that it is a much heavier operation: the expression
+is parsed, compiled, and executed in the target, and its inputs are the frame
+locals the expression names.
 
 An advantage of `frame variable` is that it allows static dereferencing of
 pointers with the `*` operator, e.g. `frame variable *a_pointer`.

@@ -1,0 +1,134 @@
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
+
+# COM: Verify that `expression` evaluates a Mojo expression against the locals
+# COM: of the selected frame and produces a normal LLDB result variable.
+# COM:
+# COM: The categories mirror the ones LLDB's C++ expression tests cover, kept
+# COM: to what the Mojo evaluator supports today: frame locals, literals, the
+# COM: arithmetic/comparison/logical operators, unary operators, the scalar
+# COM: types whose source type is recovered from debug info, and successive
+# COM: result variables. See `expression-unsupported.lldb` for the categories
+# COM: that do not work yet.
+
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs + rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- 1 + 2' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs * rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs - rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- -lhs' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs < rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs == rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- answer == 42' \
+# RUN:   -X -o -X 'expression --language mojo -- flag and True' \
+# RUN:   -X -o -X 'expression --language mojo -- not flag' \
+# RUN:   -X -o -X 'expression --language mojo -- count' \
+# RUN:   -X -o -X 'expression --language mojo -- flag' \
+# RUN:   -X -o -X 'expression --language mojo -- ratio' \
+# RUN:   -X -o -X 'expression --language mojo -- text' \
+# RUN:   '%S/Inputs/expression.mojo' | FileCheck %s
+
+# COM: A bare expression binds a generated result variable instead of
+# COM: discarding the value with `_ = `, so each evaluation yields a `$R`
+# COM: result rather than nothing at all. The names advance across
+# COM: evaluations, which is what ties them to the persistent state.
+
+# COM: Frame locals through a binary operator, and a literal expression that
+# COM: names no frame local at all.
+# CHECK: (Int) $R0 = 42
+# CHECK: (Int) $R1 = 3
+
+# COM: The remaining arithmetic and the unary operator.
+# CHECK: (Int) $R2 = 440
+# CHECK: (Int) $R3 = -2
+# CHECK: (Int) $R4 = -20
+
+# COM: Comparisons and logical operators produce `Bool`.
+# CHECK: (Bool) $R5 = True
+# CHECK: (Bool) $R6 = False
+# CHECK: (Bool) $R7 = True
+# CHECK: (Bool) $R8 = True
+# CHECK: (Bool) $R9 = False
+
+# COM: A frame local of each type that reaches the expression context. `Int`,
+# COM: `UInt` and `Bool` have their source type recovered from the scalar
+# COM: storage type in debug info; `Float64` does not, so it still evaluates
+# COM: but reports its storage type.
+# CHECK: (UInt) $R10 = 7
+# CHECK: (Bool) $R11 = True
+# CHECK: {{.*}}f64{{.*}} $R12 = 2.5
+# CHECK: (String) $R13 = "hello"
+
+# COM: Methods on a frame local, and a call composed with a frame local.
+# COM: `len(text)` is deliberately rejected by Mojo itself -- a UTF-8 string
+# COM: has no single length -- so the byte/codepoint APIs it points at are
+# COM: what gets exercised here.
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- text.byte_length()' \
+# RUN:   -X -o -X 'expression --language mojo -- len(text.codepoints())' \
+# RUN:   -X -o -X 'expression --language mojo -- text.byte_length() + lhs' \
+# RUN:   '%S/Inputs/expression.mojo' | FileCheck --check-prefix=METHOD %s
+
+# METHOD: (Int) $R0 = 5
+# METHOD: (Int) $R1 = 5
+# METHOD: (Int) $R2 = 25
+
+# COM: Several statements separated by `;`. The value of the *last* statement
+# COM: becomes the result, so earlier ones can set up locals for it. Locals
+# COM: declared this way live only for the expression that declares them; see
+# COM: `expression-unsupported.lldb` for reading one back afterwards.
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- var t = lhs + rhs; t' \
+# RUN:   -X -o -X 'expression --language mojo -- var a = 1; var b = 2; a + b' \
+# RUN:   -X -o -X 'expression --language mojo -- var t = lhs * 2; t + 1' \
+# RUN:   -X -o -X 'expression --language mojo -- 1 + 2; 3 + 4' \
+# RUN:   '%S/Inputs/expression.mojo' | FileCheck --check-prefix=SEQ %s
+
+# SEQ: (Int) $R0 = 42
+# SEQ: (Int) $R1 = 3
+# SEQ: (Int) $R2 = 41
+# SEQ: (Int) $R3 = 7
+
+# COM: When more than one statement leaves its value unused, the parser emits
+# COM: a fix-it for each. Only the last becomes the result; the earlier ones
+# COM: keep the `_ = ` discard. That combined rewrite is no longer purely
+# COM: internal, so it goes through LLDB's Fix-It channel and IS announced --
+# COM: the one case where the banner is expected.
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs + rhs; lhs - rhs' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 | FileCheck --check-prefix=MULTIFIX %s
+
+# COM: The result reaches stdout before the banner reaches stderr.
+# MULTIFIX: (Int) $R0 = -2
+# MULTIFIX: applying Fix-It
+# MULTIFIX-NEXT: _ = lhs + rhs; var __lldb_expr_result = lhs - rhs
+
+# COM: The rewrite to `__lldb_expr_result` goes through the parser's fix-it
+# COM: machinery, but it is an internal detail rather than a correction to
+# COM: what the user typed, so LLDB must not announce it. The banner is
+# COM: written to the error stream, hence the separate run with stderr merged.
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs + rhs' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=NOBANNER \
+# RUN:       --implicit-check-not='applying Fix-It' %s
+
+# NOBANNER: (Int) $R0 = 42

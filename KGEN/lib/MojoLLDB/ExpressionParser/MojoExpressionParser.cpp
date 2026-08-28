@@ -34,15 +34,22 @@
 #include "lldb/Expression/DiagnosticManager.h"
 #include "lldb/Expression/IRExecutionUnit.h"
 #include "lldb/Expression/Materializer.h"
+#include "lldb/Symbol/Type.h"
+#include "lldb/Symbol/Variable.h"
+#include "lldb/Symbol/VariableList.h"
 #include "lldb/Target/ExecutionContextScope.h"
 #include "lldb/Target/StackFrame.h"
 #include "lldb/Target/Target.h"
 #include "lldb/Utility/LLDBLog.h"
+#include "lldb/ValueObject/ValueObject.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/DebugStringHelper.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Target/TargetMachine.h"
@@ -51,6 +58,8 @@ using namespace M;
 using namespace M::KGEN;
 using namespace M::KGEN::Mojo;
 using namespace lldb_private;
+
+static constexpr StringLiteral kLLDBResultVariableName = "__lldb_expr_result";
 
 //===----------------------------------------------------------------------===//
 // MojoExpressionParser::Impl
@@ -67,6 +76,7 @@ struct MojoExpressionParser::Impl {
   MojoTypeSystem *typeSystem = nullptr;
 
   /// The compilation options to use when compiling.
+  std::optional<KGEN::CompilationOptions> expressionCompilationOptions;
   const KGEN::CompilationOptions *compilationOptions = nullptr;
 
   /// The ObjectCompiler instance to use when parsing.
@@ -85,6 +95,20 @@ struct MojoExpressionParser::Impl {
   /// state if compilation of the expression succeeds.
   SmallVector<std::pair<StringRef, mlir::Type>> newPersistentVariables;
 
+  /// The result variable produced for a bare expression, if any.
+  std::optional<std::pair<StringRef, mlir::Type>> resultVariable;
+
+  /// The frame selected when this expression parser was created.
+  lldb::StackFrameWP frame;
+
+  /// In-scope program variables passed to the expression materializer. Their
+  /// order must match their order in the parser's input-variable list.
+  SmallVector<lldb::VariableSP> frameVariables;
+
+  /// Names supplied by frame variables. A frame variable shadows a persistent
+  /// REPL variable with the same name.
+  DenseSet<ConstString> frameVariableNames;
+
   /// The target on which expressions will be evaluated.
   lldb::TargetSP target;
 
@@ -97,6 +121,7 @@ MojoExpressionParser::Impl::Impl(ExecutionContextScope *exeScope,
                                  const EvaluateExpressionOptions &options)
     : expr(expr), options(options) {
   // Bail out if we don't have a valid execution context.
+  frame = exeScope ? exeScope->CalculateStackFrame() : nullptr;
   target = exeScope ? exeScope->CalculateTarget() : nullptr;
   if (!target)
     return;
@@ -111,7 +136,9 @@ MojoExpressionParser::Impl::Impl(ExecutionContextScope *exeScope,
     return;
   }
   typeSystem = llvm::cast<MojoTypeSystem>(typeSystemOr.get().get());
-  compilationOptions = &typeSystem->getParserContext().getCompilationOptions();
+  expressionCompilationOptions.emplace(
+      typeSystem->getParserContext().getCompilationOptions());
+  compilationOptions = &*expressionCompilationOptions;
   MLIRContext *ctx = typeSystem->getMLIRContext();
 
   // TODO(#33931) HACK, HACK, HACK!!!
@@ -121,16 +148,22 @@ MojoExpressionParser::Impl::Impl(ExecutionContextScope *exeScope,
   // for ORC JIT but not always for MCJIT.
   // Disable splitting and parallelize LLC pipeline
   // (which is based on splitting) for REPL.
-  KGEN::CompilationOptions hackCompilationOptions = *compilationOptions;
-  hackCompilationOptions.enableLLVMPerFunctionSplitting = false;
-  hackCompilationOptions.enableParallelLLC = false;
+  expressionCompilationOptions->enableLLVMPerFunctionSplitting = false;
+  expressionCompilationOptions->enableParallelLLC = false;
+
+  // Debugger expressions must preserve the stores and temporary values needed
+  // for result materialization even when they otherwise appear dead to the
+  // optimizer. REPL cells have no materialized result, so they keep the
+  // target's optimization level to avoid a large performance regression.
+  if (!options.GetREPLEnabled())
+    expressionCompilationOptions->optimizationLevel = 0;
 
   PassManagerConfigOptions pmOptions;
   pmOptions.operationName = ModuleOp::getOperationName();
 
   // Create the compiler instance.
   auto compilerOr =
-      ObjectCompiler::create(kMojoCacheBaseDirName, hackCompilationOptions,
+      ObjectCompiler::create(kMojoCacheBaseDirName, *compilationOptions,
                              /*isJIT=*/true, *ctx, pmOptions);
 
   if (failed(compilerOr))
@@ -186,6 +219,42 @@ static std::string formatSMDiagnostic(const llvm::SMDiagnostic &diag,
   return msg;
 }
 
+/// Collect every identifier-like token in `exprText`. This intentionally
+/// over-approximates: tokens inside comments and string literals are included,
+/// because a spurious extra name only costs one materialized variable while a
+/// missed name would make that variable unavailable to the expression.
+static DenseSet<StringRef> collectIdentifiers(StringRef exprText) {
+  auto isIdentifierChar = [](char c) { return llvm::isAlnum(c) || c == '_'; };
+
+  DenseSet<StringRef> identifiers;
+  for (size_t i = 0, e = exprText.size(); i != e;) {
+    // Mojo allows arbitrary text as an identifier when it is backtick quoted.
+    if (exprText[i] == '`') {
+      size_t end = exprText.find('`', i + 1);
+      if (end == StringRef::npos)
+        break;
+      identifiers.insert(exprText.slice(i + 1, end));
+      i = end + 1;
+      continue;
+    }
+    if (!isIdentifierChar(exprText[i]) || llvm::isDigit(exprText[i])) {
+      ++i;
+      continue;
+    }
+    size_t start = i;
+    while (i != e && isIdentifierChar(exprText[i]))
+      ++i;
+    identifiers.insert(exprText.slice(start, i));
+  }
+  return identifiers;
+}
+
+/// Return true if `name` collides with an identifier generated by the REPL
+/// expression wrapper or by this plugin.
+static bool isReservedExpressionName(StringRef name) {
+  return name.starts_with("__lldb") || name.starts_with("__mojo_repl");
+}
+
 //===----------------------------------------------------------------------===//
 // LLDBMojoREPLListener
 //===----------------------------------------------------------------------===//
@@ -194,17 +263,27 @@ namespace {
 /// This class implements a parser listener that communicates between the Mojo
 /// parser and the repl.
 class LLDBMojoREPLListener : public MojoParserREPLListener {
+  enum class FixItDisposition {
+    /// Pass the parser's fixed text to LLDB unchanged.
+    Passthrough,
+    /// The only diagnostic binds an otherwise-unused value for LLDB.
+    InternalResultRewrite,
+    /// The result binding is combined with a user-visible correction.
+    VisibleResultRewrite,
+  };
+
 public:
   LLDBMojoREPLListener(
-      StringRef currentModuleName, MojoUserExpression &expr,
+      StringRef currentModuleName, StringRef exprText, MojoUserExpression &expr,
       DiagnosticManager &diagnosticManager,
       const EvaluateExpressionOptions &options,
       SmallVectorImpl<std::pair<StringRef, mlir::Type>> &newPersistentVariables,
+      std::optional<std::pair<StringRef, mlir::Type>> &resultVariable,
       MojoExpressionLogger &expressionLogger)
-      : currentModuleName(currentModuleName), expr(expr),
+      : currentModuleName(currentModuleName), exprText(exprText), expr(expr),
         diagnosticManager(diagnosticManager), options(options),
         newPersistentVariables(newPersistentVariables),
-        expressionLogger(expressionLogger) {}
+        resultVariable(resultVariable), expressionLogger(expressionLogger) {}
   ~LLDBMojoREPLListener() override = default;
 
   //===--------------------------------------------------------------------===//
@@ -216,12 +295,46 @@ public:
   }
 
   void notifyFixedExpr(StringRef fixedExpr) override {
+    if (fixItDisposition == FixItDisposition::Passthrough) {
+      expr.setFixedText(fixedExpr);
+      return;
+    }
+
+    // A bare Mojo expression is normally fixed to `_ = expression`, which
+    // explicitly discards its value. For an LLDB expression, replace that
+    // insertion with a generated result variable so the value can be
+    // materialized and displayed by LLDB.
+    if (discardFixItOffset && *discardFixItOffset <= fixedExpr.size() &&
+        fixedExpr.drop_front(*discardFixItOffset).starts_with(kDiscardText)) {
+      std::string resultExpr = fixedExpr.str();
+      resultExpr.replace(*discardFixItOffset, kDiscardText.size(),
+                         ("var " + kLLDBResultVariableName + " = ").str());
+
+      if (fixItDisposition == FixItDisposition::InternalResultRewrite) {
+        internalRewrite = std::move(resultExpr);
+        return;
+      }
+      expr.setFixedText(resultExpr);
+      return;
+    }
     expr.setFixedText(fixedExpr);
   }
+
+  //===--------------------------------------------------------------------===//
+  // Internal rewrite
+
+  /// Whether the parser's fix-it was solely our own result-variable rewrite,
+  /// which `parse` re-parses itself rather than reporting to LLDB.
+  bool hasInternalRewrite() const { return internalRewrite.has_value(); }
+
+  /// Take the rewritten expression text. Only valid once.
+  std::string takeInternalRewrite() { return std::move(*internalRewrite); }
 
   void notifyDiagnostics(ArrayRef<llvm::SMDiagnostic> diagnostics) override {
     expressionLogger.debugLog("Found {0} diagnostic{1}\n", diagnostics.size(),
                               diagnostics.size() == 1 ? "" : "s");
+
+    classifyFixIts(diagnostics);
 
     for (const llvm::SMDiagnostic &diag : diagnostics) {
       expressionLogger.debugLog("Diagnostic with fixits: {0}, message:\n{1}",
@@ -231,6 +344,7 @@ public:
       // removes problems with emitting multiple diagnostics for the same
       // expression.
       llvm::SourceMgr::DiagKind diagKind = diag.getKind();
+
       if (diagKind == llvm::SourceMgr::DK_Warning ||
           diagKind == llvm::SourceMgr::DK_Remark) {
         if (MojoPersistentExpressionState::isExpressionModuleName(
@@ -273,6 +387,11 @@ public:
   // Queries
 
   bool shouldPersistVariable(StringRef name, mlir::Type type) override {
+    if (isResultVariable(name)) {
+      resultVariable.emplace(name, type);
+      return true;
+    }
+
     auto canPersist = [&] {
       // We always persist internal repl variables used for execution state.
       if (MojoParserContext::isHiddenPersistentVariable(name))
@@ -299,16 +418,114 @@ public:
     return false;
   }
 
+  bool isResultVariable(StringRef name) override {
+    // A result is only produced when persistence was not suppressed, so a
+    // variable that merely shares the name is not claimed as the result.
+    return name == kLLDBResultVariableName &&
+           !options.GetSuppressPersistentResult();
+  }
+
 private:
   StringRef currentModuleName;
+  /// The source buffer holding the expression the parser was given. Fix-it
+  /// ranges point into this buffer, which is a copy of `expr.Text()`.
+  StringRef exprText;
   MojoUserExpression &expr;
   DiagnosticManager &diagnosticManager;
   const EvaluateExpressionOptions &options;
   SmallVectorImpl<std::pair<StringRef, mlir::Type>> &newPersistentVariables;
+  std::optional<std::pair<StringRef, mlir::Type>> &resultVariable;
   MojoExpressionLogger &expressionLogger;
+
+  /// Return the offsets of `range` within the expression text, if both ends
+  /// point into that text.
+  std::optional<std::pair<size_t, size_t>>
+  getExprOffsets(llvm::SMRange range) const {
+    if (!range.isValid())
+      return std::nullopt;
+    const char *start = range.Start.getPointer();
+    const char *end = range.End.getPointer();
+    if (start < exprText.begin() || start > exprText.end() || end < start ||
+        end > exprText.end())
+      return std::nullopt;
+    return std::pair(start - exprText.begin(), end - exprText.begin());
+  }
+
+  /// Return true if `diag` is the parser warning whose fix-it discards an
+  /// otherwise-unused value.
+  bool isUnusedValueDiagnostic(const llvm::SMDiagnostic &diag) const {
+    return !options.GetREPLEnabled() &&
+           !options.GetSuppressPersistentResult() &&
+           diag.getKind() == llvm::SourceMgr::DK_Warning &&
+           diag.getMessage().contains(
+               "value is unused; assign to '_' to discard the result") &&
+           diag.getFixIts().size() == 1 &&
+           diag.getFixIts().front().getText() == kDiscardText;
+  }
+
+  /// Classify the parser's fix-its and locate the unused-value insertion in
+  /// the fully fixed text. Fix-it ranges refer to the original expression, so
+  /// account for the text inserted or removed by every preceding fix-it.
+  void classifyFixIts(ArrayRef<llvm::SMDiagnostic> diagnostics) {
+    fixItDisposition = FixItDisposition::Passthrough;
+    discardFixItOffset.reset();
+
+    size_t previousEnd = 0;
+    size_t fixedPrefixSize = 0;
+    size_t numFixIts = 0;
+    bool offsetsAreTrackable = true;
+
+    for (const llvm::SMDiagnostic &diag : diagnostics) {
+      bool isUnusedValue = isUnusedValueDiagnostic(diag);
+      for (const llvm::SMFixIt &fixIt : diag.getFixIts()) {
+        ++numFixIts;
+        std::optional<std::pair<size_t, size_t>> offsets =
+            getExprOffsets(fixIt.getRange());
+        if (!offsets || offsets->first < previousEnd) {
+          offsetsAreTrackable = false;
+          continue;
+        }
+        if (!offsetsAreTrackable)
+          continue;
+
+        fixedPrefixSize += offsets->first - previousEnd;
+        if (isUnusedValue)
+          discardFixItOffset = fixedPrefixSize;
+        fixedPrefixSize += fixIt.getText().size();
+        previousEnd = offsets->second;
+      }
+    }
+
+    if (!discardFixItOffset)
+      return;
+
+    // Only the exact single-diagnostic case is internal. Any accompanying
+    // diagnostic follows LLDB's normal, user-visible Fix-It path so it cannot
+    // be hidden when the internal rewrite is re-parsed.
+    bool isOnlyUnusedValueDiagnostic =
+        diagnostics.size() == 1 && numFixIts == 1 &&
+        isUnusedValueDiagnostic(diagnostics.front());
+    fixItDisposition =
+        isOnlyUnusedValueDiagnostic
+            ? FixItDisposition::InternalResultRewrite
+            : FixItDisposition::VisibleResultRewrite;
+  }
+
+  /// The text the parser inserts to discard an unused expression value.
+  static constexpr StringLiteral kDiscardText = "_ = ";
 
   /// A flag indicating if that the last processed diagnostic was ignored.
   bool lastDiagnosticIgnored = false;
+
+  /// Where the parser inserted the discard fix-it for a bare expression, if it
+  /// did so.
+  std::optional<size_t> discardFixItOffset;
+
+  /// How the current batch of parser fix-its should be exposed to LLDB.
+  FixItDisposition fixItDisposition = FixItDisposition::Passthrough;
+
+  /// The rewritten expression text, when the only fix-it was our own.
+  std::optional<std::string> internalRewrite;
 };
 } // namespace
 
@@ -351,24 +568,143 @@ MojoExpressionParser::parse(MojoPersistentExpressionState &state,
     impl->expressionLogger->errorLog("{0}", errs);
   });
 
-  // Collect the current persistent variables.
+  // Collect in-scope variables from the selected program frame. Only the
+  // variables the expression actually names are collected: the generated
+  // context struct is laid out at compile time, so a variable that later fails
+  // to materialize aborts the whole expression, and materializing an entire
+  // frame would make that failure depend on code the user never referenced.
   SmallVector<std::pair<StringRef, mlir::Type>> variables;
-  state.collectPersistentVariables(variables);
+  impl->frameVariables.clear();
+  impl->frameVariableNames.clear();
+  DenseSet<StringRef> referencedNames = collectIdentifiers(impl->expr.Text());
+  DenseSet<ConstString> seenFrameVariableNames;
+  if (lldb::StackFrameSP frame = impl->frame.lock()) {
+    lldb::VariableListSP frameVariableList =
+        frame->GetInScopeVariableList(/*getFileGlobals=*/false,
+                                      /*includeSyntheticVars=*/false,
+                                      /*mustHaveValidLocation=*/true);
+    if (frameVariableList) {
+      for (lldb::VariableSP variable : *frameVariableList) {
+        if (!variable || variable->IsArtificial())
+          continue;
 
-  // Parse the expression.
-  auto [expressionId, exprModuleName] = state.getNextExpressionModuleName();
-  LLDBMojoREPLListener listener(exprModuleName, impl->expr, diagnosticManager,
-                                impl->options, impl->newPersistentVariables,
-                                *impl->expressionLogger);
-  // Create a function name for the expression. This string must be a valid Mojo
-  // identifier.
-  std::string exprFnName = ("__lldb_expr__" + Twine(expressionId)).str();
-  int exprFileId = sourceMgr.AddNewSourceBuffer(
-      llvm::MemoryBuffer::getMemBufferCopy(impl->expr.Text(), exprModuleName),
-      llvm::SMLoc());
+        // Variable::GetName() and Variable::GetType() are not exported by
+        // liblldb. Go through the public StackFrame/ValueObject boundary to
+        // obtain the same information from a loadable language plugin.
+        lldb::ValueObjectSP value = frame->GetValueObjectForFrameVariable(
+            variable, lldb::eNoDynamicValues);
+        if (!value)
+          continue;
+
+        ConstString name = value->GetName();
+        if (name.IsEmpty() || !referencedNames.contains(name.GetStringRef()))
+          continue;
+
+        // A name generated by the expression wrapper cannot be passed through
+        // it, and one shadowing the generated result would break the result
+        // field's layout.
+        if (isReservedExpressionName(name.GetStringRef()))
+          continue;
+
+        // An inner scope wins over an outer scope of the same name; the list
+        // is ordered innermost first.
+        if (!seenFrameVariableNames.insert(name).second)
+          continue;
+
+        CompilerType compilerType = value->GetCompilerType();
+        if (!compilerType.IsValid() ||
+            !compilerType.GetTypeSystem<MojoTypeSystem>())
+          continue;
+
+        // Debug-info types live in a module-specific MLIRContext, while
+        // expression parsing uses the target's scratch MojoTypeSystem. Reparse
+        // the type spelling in the scratch context instead of passing an MLIR
+        // type across contexts.
+        mlir::Type debugMLIRType =
+            mlir::Type::getFromOpaquePointer(compilerType.GetOpaqueQualType());
+        std::string typeName = mlir::debugString(debugMLIRType);
+        CompilerType expressionCompilerType =
+            impl->typeSystem->getBuiltinTypeFromMLIRTypeName(typeName);
+        if (!expressionCompilerType.IsValid()) {
+          impl->expressionLogger->debugLog(
+              "Skipping frame variable '{0}': cannot import Mojo type {1}",
+              name.GetStringRef(), typeName);
+          continue;
+        }
+
+        mlir::Type expressionType = mlir::Type::getFromOpaquePointer(
+            expressionCompilerType.GetOpaqueQualType());
+        variables.emplace_back(name.GetStringRef(), expressionType);
+        impl->frameVariables.push_back(std::move(variable));
+        // Note that `frameVariableNames` deliberately lags
+        // `seenFrameVariableNames`: a frame variable whose type could not be
+        // imported is not a usable input, so a persistent variable of the same
+        // name stays visible to the expression.
+        impl->frameVariableNames.insert(name);
+      }
+    }
+  }
+
+  // Persistent REPL variables follow frame variables in both the parser input
+  // and the materializer. The selected frame takes precedence on collisions.
+  state.collectPersistentVariables(variables, impl->frameVariableNames);
+
+  // Parse the expression. `parseExpr` is used twice: once for the text the
+  // user typed, and again if the only thing the parser fixed was our own
+  // result-variable rewrite.
+  std::optional<LLDBMojoREPLListener> listener;
+  MojoParserContext::ParsedREPLExpr result;
+  // Both outlive the lambda: `exprModuleName` backs a StringRef held by the
+  // listener, and `exprFnName` names the compiled entry point further down.
+  std::string exprModuleName;
+  std::string exprFnName;
+  auto parseExpr = [&](StringRef exprText) {
+    size_t expressionId;
+    std::tie(expressionId, exprModuleName) =
+        state.getNextExpressionModuleName();
+    // Create a function name for the expression. This string must be a valid
+    // Mojo identifier.
+    exprFnName = ("__lldb_expr__" + Twine(expressionId)).str();
+    int exprFileId = sourceMgr.AddNewSourceBuffer(
+        llvm::MemoryBuffer::getMemBufferCopy(exprText, exprModuleName),
+        llvm::SMLoc());
+    listener.emplace(exprModuleName,
+                     sourceMgr.getMemoryBuffer(exprFileId)->getBuffer(),
+                     impl->expr, diagnosticManager, impl->options,
+                     impl->newPersistentVariables, impl->resultVariable,
+                     *impl->expressionLogger);
+    result = parserContext.parseREPLExpression(
+        *listener, exprFileId, exprFnName, variables,
+        /*numProgramVariables=*/impl->frameVariables.size());
+  };
+  parseExpr(impl->expr.Text());
+
+  // Binding a bare expression to a generated result variable is an internal
+  // detail rather than a correction to what the user typed, so it is re-parsed
+  // here instead of being handed back to LLDB as a fix-it. Going through
+  // LLDB's fix-it channel would make it announce the rewritten text on every
+  // bare expression.
+  if (listener->hasInternalRewrite() && impl->options.GetAutoApplyFixIts()) {
+    std::string rewritten = listener->takeInternalRewrite();
+    impl->expressionLogger->debugLog(
+        "Rewrote the input to capture its result:\n{0}", rewritten);
+
+    // Drop everything the first parse produced: the un-fixed module must not
+    // stay in the REPL history, its diagnostics describe text that is being
+    // replaced, and the variables it collected would otherwise be counted
+    // twice.
+    if (result.isValid())
+      parserContext.removeLastREPLExpression();
+    diagnosticManager.Clear();
+    impl->newPersistentVariables.clear();
+    impl->resultVariable.reset();
+
+    parseExpr(rewritten);
+  }
+
+  // Record the entry point only once the text is settled: `setFunctionName`
+  // may be called a single time, and only `prepareForExecution` reads it back.
   impl->expr.setFunctionName(exprFnName);
-  MojoParserContext::ParsedREPLExpr result = parserContext.parseREPLExpression(
-      listener, exprFileId, exprFnName, variables);
 
   // If the parser supplied a fixed expression, abort processing and use that
   // expression instead.
@@ -402,7 +738,7 @@ MojoExpressionParser::parse(MojoPersistentExpressionState &state,
     LLDBMojoREPLListener &listener;
     MojoParserContext &parserContext;
   };
-  MLIRDiagnosticHandlerContext handlerContext{listener, parserContext};
+  MLIRDiagnosticHandlerContext handlerContext{*listener, parserContext};
   sourceMgr.setDiagHandler(
       [](const llvm::SMDiagnostic &diag, void *context) {
         auto *ctx = static_cast<MLIRDiagnosticHandlerContext *>(context);
@@ -548,7 +884,39 @@ Status MojoExpressionParser::prepareForExecution(
 
   // Extract the function information for the expression entry point.
   Status error = executionUnit->getRunnableInfo(funcAddr, funcEnd);
-  if (error.Fail() || !keepResultInMemory)
+  if (error.Fail())
+    return error;
+
+  auto *persistentState = static_cast<MojoPersistentExpressionState *>(
+      impl->typeSystem->GetPersistentExpressionState());
+
+  // The input fields of the generated context struct must be materialized
+  // whatever happens to the result, because the struct's layout was fixed when
+  // the expression was compiled. Register frame variables first so that layout
+  // matches the input-variable order used to compile the expression wrapper.
+  for (lldb::VariableSP &variable : impl->frameVariables) {
+    impl->expr.GetMaterializer()->AddVariable(variable, error);
+    if (error.Fail())
+      return error;
+  }
+
+  // Register the current persistent variables with the materializer. This must
+  // walk the state exactly the way `parse` did when it built the parser's
+  // input list.
+  persistentState->forEachInputVariable(
+      impl->frameVariableNames,
+      [&](lldb::ExpressionVariableSP &var, mlir::Type) {
+        if (error.Fail())
+          return;
+        impl->expr.GetMaterializer()->AddPersistentVariable(var, nullptr,
+                                                            error);
+      });
+  if (error.Fail())
+    return error;
+
+  // Nothing produced by this evaluation outlives it, so there are no output
+  // fields to register.
+  if (!keepResultInMemory)
     return error;
 
   // Compute the target info to use for the persistent variable state.
@@ -556,30 +924,34 @@ Status MojoExpressionParser::prepareForExecution(
   lldb::ByteOrder byteOrder = process->GetByteOrder();
   size_t addressByteSize = process->GetAddressByteSize();
 
-  // If we successfully compiled the expression, we can now comfortably register
-  // the persistent state variables.
-  auto *persistentState = static_cast<MojoPersistentExpressionState *>(
-      impl->typeSystem->GetPersistentExpressionState());
+  // The output fields of the generated context struct are emitted sorted by
+  // name (see `processVariablesForPersistence`), and the result variable is
+  // just another output field. Register the outputs in that same order so the
+  // materializer's offsets line up with the compiled struct.
+  SmallVector<std::pair<StringRef, mlir::Type>> outputs(
+      impl->newPersistentVariables);
+  if (impl->resultVariable)
+    outputs.push_back(*impl->resultVariable);
+  llvm::sort(outputs, [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
 
-  // Register the current persistent variables with the materializer.
-  DenseSet<ConstString> persistentVariableNames;
-  for (int i : llvm::reverse(llvm::seq<int>(0, persistentState->GetSize()))) {
-    lldb::ExpressionVariableSP var = persistentState->GetVariableAtIndex(i);
-    assert(var && "expected valid variable in persistent state");
-
-    // Skip variables that got redefined.
-    if (!persistentVariableNames.insert(var->GetName()).second)
-      continue;
-
-    // Try adding the variable to the expression materializer.
-    impl->expr.GetMaterializer()->AddPersistentVariable(var, nullptr, error);
-    if (error.Fail())
-      return error;
-  }
-
-  // Register the newly created persistent variables.
+  // Register the newly created persistent variables and, if the expression
+  // produced one, LLDB's result.
   std::vector<lldb::ExpressionVariableSP> persistentVariables;
-  for (auto [name, mlirType] : impl->newPersistentVariables) {
+  for (auto [name, mlirType] : outputs) {
+    // The result of a bare expression is written straight into storage owned
+    // by the materializer rather than into the persistent state.
+    if (impl->resultVariable && name == impl->resultVariable->first) {
+      CompilerType resultType(
+          impl->typeSystem->weak_from_this(),
+          const_cast<void *>(mlirType.getAsOpaquePointer()));
+      impl->expr.addResultVariable(resultType, keepResultInMemory, error);
+      if (error.Fail())
+        return error;
+      continue;
+    }
+
     // All persistent variables in the REPL are references, so wrap them in a
     // reference type.
     auto ptr = LIT::REPLResultRefType::get(mlirType);

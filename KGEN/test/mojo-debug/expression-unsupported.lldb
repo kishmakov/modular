@@ -1,0 +1,105 @@
+# ===----------------------------------------------------------------------=== #
+#
+# This file is Modular Inc proprietary.
+#
+# ===----------------------------------------------------------------------=== #
+
+# COM: Categories that LLDB's C++ expression tests cover but the Mojo
+# COM: evaluator does not support yet. They are pinned here so that the
+# COM: failure mode stays a real diagnostic rather than silence, and so that
+# COM: the day one of them starts working is visible in the diff.
+# COM:
+# COM: The common cause is the round-trip that carries a frame variable's
+# COM: type from debug info into the expression context: the type is printed
+# COM: and reparsed there, and some types come back opaque as
+# COM: `AnyStruct[...]`, leaving member access, methods and subscripting
+# COM: nothing to resolve against. A plain stdlib struct such as `String`
+# COM: survives the round-trip and its methods do work -- see the METHOD
+# COM: cases in `expression.lldb`. A parameterized one such as `Array[Int]`,
+# COM: and anything declared in the program's own module such as `Point`, do
+# COM: not; for the latter the parser also reports that it cannot locate the
+# COM: program module. Fixing this needs a general source-type encoding in
+# COM: debug info, not more special cases in the debugger.
+# COM:
+# COM: `frame variable point.x` reads the same field without the expression
+# COM: evaluator and does work today.
+# COM:
+# COM: Each case gets its own run: `-b` abandons the remaining `-o` commands
+# COM: once one of them reports an error. `not` is needed because a failed
+# COM: expression makes the debugger exit non-zero.
+
+# COM: An unresolved name reports the parser's own diagnostic. This is the
+# COM: case that keeps failures from going silent: every one below depends on
+# COM: diagnostics reaching LLDB rather than only the expression log.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- unknown_identifier' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=UNKNOWN %s
+# UNKNOWN: error: {{.*}}use of unknown declaration 'unknown_identifier'
+
+# COM: `comptime` module-level constants are not in the expression's scope.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- kScale' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=COMPTIME %s
+# COMPTIME: error: {{.*}}use of unknown declaration 'kScale'
+
+# COM: Member access on a user-defined struct.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- point.x' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=MEMBER %s
+# MEMBER: error: {{.*}}'Point' has no attributes
+
+# COM: Calling a method on a user-defined struct.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- point.sum()' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=METHOD %s
+# METHOD: error: {{.*}}'Point' has no attributes
+
+# COM: Subscripting a list.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- numbers[0]' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=SUBSCRIPT %s
+# SUBSCRIPT: error: {{.*}}'Array' is not subscriptable
+
+# COM: LLDB's own persistent variables, `$R0` and friends, cannot be named
+# COM: from a Mojo expression at all: `$` is not a valid Mojo lexeme, so
+# COM: reading a previous result back fails in the lexer rather than in name
+# COM: lookup. The same applies to declaring one, as C++ does with
+# COM: `int $i = 123`.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs + rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- $R0 + 1' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=RESULTREUSE %s
+# RESULTREUSE: (Int) $R0 = 42
+# RESULTREUSE: error: {{.*}}unexpected character
+
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- $myvar = 5' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=DOLLARIDENT %s
+# DOLLARIDENT: error: {{.*}}1:1: unexpected character
+
+# COM: A local declared by an expression does not outlive it. Within one
+# COM: expression the statements do see each other, which
+# COM: `expression.lldb` covers; across two they do not, because user
+# COM: variables are only persisted in REPL mode.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- var v = lhs + rhs; v * 2' \
+# RUN:   -X -o -X 'expression --language mojo -- v' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=NOPERSIST %s
+# NOPERSIST: (Int) $R0 = 84
+# NOPERSIST: error: {{.*}}use of unknown declaration 'v'
+
+# COM: Assigning to a frame local parses and runs, but the materializer
+# COM: cannot write the value back.
+# RUN: not %debug -X -b -X -o -X 'b expression.mojo:42' -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- lhs = 99' \
+# RUN:   '%S/Inputs/expression.mojo' 2>&1 \
+# RUN:   | FileCheck --check-prefix=ASSIGN %s
+# ASSIGN: error: {{.*}}couldn't write the new contents of lhs back into the variable

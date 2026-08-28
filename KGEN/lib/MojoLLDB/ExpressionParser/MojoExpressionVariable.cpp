@@ -158,21 +158,47 @@ lldb::addr_t MojoPersistentExpressionState::LookupSymbol(ConstString name) {
   return PersistentExpressionState::LookupSymbol(name);
 }
 
-void MojoPersistentExpressionState::collectPersistentVariables(
-    SmallVectorImpl<std::pair<StringRef, Type>> &variables) {
+ConstString
+MojoPersistentExpressionState::GetNextPersistentVariableName(bool isError) {
+  return ConstString((Twine(GetPersistentVariablePrefix(isError)) +
+                      Twine(nextPersistentVariableID++))
+                         .str());
+}
+
+void MojoPersistentExpressionState::forEachInputVariable(
+    const DenseSet<ConstString> &shadowedNames,
+    llvm::function_ref<void(lldb::ExpressionVariableSP &, Type)> callback) {
   DenseSet<ConstString> persistentVariableNames;
   for (int i : llvm::reverse(llvm::seq<int>(0, GetSize()))) {
     lldb::ExpressionVariableSP var = GetVariableAtIndex(i);
     assert(var && "expected valid variable in persistent state");
+
+    // Skip variables that got redefined.
     if (!persistentVariableNames.insert(var->GetName()).second)
       continue;
 
-    // All persistent variable types are wrapped in a reference type, so unwrap
-    // the types before adding them to the current expression.
-    auto ptrType = cast<LIT::REPLResultRefType>(
-        Type::getFromOpaquePointer(var->GetCompilerType().GetOpaqueQualType()));
+    // An in-scope program variable shadows a persistent variable.
+    if (shadowedNames.contains(var->GetName()))
+      continue;
 
-    Type varType = ptrType.getElementType();
-    variables.emplace_back(var->GetName().GetStringRef(), varType);
+    Type type =
+        Type::getFromOpaquePointer(var->GetCompilerType().GetOpaqueQualType());
+    // LLDB expression results are stored directly in the persistent state but
+    // are not REPL input variables. Only REPL variables use this reference
+    // wrapper and can be passed into a subsequent Mojo expression.
+    auto ptrType = dyn_cast<LIT::REPLResultRefType>(type);
+    if (!ptrType)
+      continue;
+
+    callback(var, ptrType.getElementType());
   }
+}
+
+void MojoPersistentExpressionState::collectPersistentVariables(
+    SmallVectorImpl<std::pair<StringRef, Type>> &variables,
+    const DenseSet<ConstString> &shadowedNames) {
+  forEachInputVariable(
+      shadowedNames, [&](lldb::ExpressionVariableSP &var, Type varType) {
+        variables.emplace_back(var->GetName().GetStringRef(), varType);
+      });
 }

@@ -280,12 +280,23 @@ bool MojoUserExpression::Parse(DiagnosticManager &diagnosticManager,
         "target mojo process does not exist", lldb::eSeverityError, false));
     return false;
   }
-  auto *exeScope = process ? (ExecutionContextScope *)process : &impl->target;
+  // Prefer the selected frame as the parser scope. A Process can calculate the
+  // target, but it cannot calculate the frame whose locals the expression must
+  // resolve. Fall back to the process for contexts without a selected frame.
+  ExecutionContextScope *exeScope = exeCtx.GetFramePtr();
+  if (!exeScope)
+    exeScope = process;
 
   // On exit, log all of the diagnostics that were collected.
   auto broadcastDiagnostics = llvm::scope_exit([&] {
     impl->expressionLogger.broadcastDiagnostics(diagnosticManager);
-    diagnosticManager.Clear();
+    // The REPL prints diagnostics itself through the logger above, so the
+    // manager is cleared to avoid reporting them twice. The `expression`
+    // command has no such path: it reports whatever the manager still holds,
+    // so clearing it there would make every failed expression fail silently,
+    // with no message at all.
+    if (m_options.GetREPLEnabled())
+      diagnosticManager.Clear();
   });
 
   // Process any magics used in the cell.
@@ -336,6 +347,16 @@ ExpressionTypeSystemHelper *MojoUserExpression::GetTypeSystemHelper() {
 lldb::ExpressionVariableSP MojoUserExpression::GetResultAfterDematerialization(
     ExecutionContextScope *exeScope) {
   return impl->resultDelegate.GetVariable();
+}
+
+void MojoUserExpression::addResultVariable(const CompilerType &type,
+                                           bool keepResultInMemory,
+                                           Status &error) {
+  // `is_lvalue` selects whether the result is a reference to storage that
+  // already exists in the program. The generated expression writes into
+  // storage the materializer supplies, so it is false here.
+  materializer->AddResultVariable(type, /*is_lvalue=*/false, keepResultInMemory,
+                                  &impl->resultDelegate, error);
 }
 
 bool MojoUserExpression::addArguments(ExecutionContext &exeCtx,

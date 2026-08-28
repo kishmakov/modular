@@ -21,6 +21,8 @@
 #include "lldb/Symbol/TaggedASTType.h"
 #include "lldb/Utility/ConstString.h"
 #include "lldb/lldb-public.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Casting.h"
 
 namespace mlir {
@@ -156,8 +158,6 @@ public:
                            uint32_t addrByteSize) override;
 
   llvm::StringRef GetPersistentVariablePrefix(bool isError) const override {
-    // TODO: This is a placeholder, and should be replaced when we actually
-    // support persistent variables.
     return isError ? "$E" : "$R";
   }
 
@@ -166,9 +166,7 @@ public:
   }
 
   lldb_private::ConstString
-  GetNextPersistentVariableName(bool isError = false) override {
-    return lldb_private::ConstString("");
-  }
+  GetNextPersistentVariableName(bool isError = false) override;
 
   std::optional<lldb_private::CompilerType> GetCompilerTypeFromPersistentDecl(
       lldb_private::ConstString typeName) override {
@@ -183,10 +181,24 @@ public:
     return expressionInstances;
   }
 
+  /// Visit the persistent REPL variables that are inputs to a new expression,
+  /// in the order they are passed to it. Variables that were redefined, LLDB
+  /// expression results, and variables whose name appears in `shadowedNames`
+  /// are skipped. `callback` receives the variable and its unwrapped element
+  /// type.
+  ///
+  /// This is the single definition of that ordering: the parser's input list
+  /// and the materializer's entity list must agree element for element, or the
+  /// generated context struct is read at the wrong offsets.
+  void forEachInputVariable(
+      const DenseSet<lldb_private::ConstString> &shadowedNames,
+      llvm::function_ref<void(lldb::ExpressionVariableSP &, Type)> callback);
+
   /// Collect the name and type of the current persistent variables within the
-  /// given state.
+  /// given state, in `forEachInputVariable` order.
   void collectPersistentVariables(
-      SmallVectorImpl<std::pair<StringRef, Type>> &variables);
+      SmallVectorImpl<std::pair<StringRef, Type>> &variables,
+      const DenseSet<lldb_private::ConstString> &shadowedNames = {});
 
 private:
   /// Instance state associated with successful expression evaluations.
@@ -200,6 +212,9 @@ private:
 
   /// The next identifier to use when building a python expression module.
   size_t nextPythonModuleID = 0;
+
+  /// The next identifier to use for an LLDB expression result.
+  size_t nextPersistentVariableID = 0;
 };
 } // namespace M::KGEN::Mojo
 

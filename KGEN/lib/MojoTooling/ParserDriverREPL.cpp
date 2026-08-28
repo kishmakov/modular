@@ -20,6 +20,7 @@
 #include "KGEN/KGENDialect/KGENOps.h"
 #include "KGEN/LITDialect/LITOps.h"
 #include "KGEN/MojoParser/ASTDecl.h"
+#include "KGEN/MojoParser/ASTType.h"
 #include "KGEN/MojoParser/DeclResolver.h"
 #include "KGEN/MojoTooling/CodeComplete.h"
 #include "KGEN/MojoTooling/PublicASTDecl.h"
@@ -30,6 +31,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Support/IndentedOstream.h"
 #include "llvm/ADT/IntervalMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -395,7 +397,9 @@ static std::string
 wrapExpressionText(MojoParserContext::REPLLocMapper::ExprLocMapper &locMapper,
                    StringRef wrappedFnName, StringRef exprText,
                    ArrayRef<std::pair<StringRef, Type>> variables,
-                   bool isFirstREPLCell) {
+                   bool isFirstREPLCell, unsigned numProgramVariables) {
+  assert(numProgramVariables <= variables.size());
+
   // Wrap the expression text in a function so that we can execute it.
   std::string transformedText;
   llvm::raw_string_ostream exprOS(transformedText);
@@ -426,15 +430,20 @@ wrapExpressionText(MojoParserContext::REPLLocMapper::ExprLocMapper &locMapper,
     exprOS << code << "\n";
   };
 
-  // Build the input struct, which contains each of the persistent variables.
+  // Build the input struct, which contains each program and persistent
+  // variable.
   exprOS << "struct __mojo_repl_context__(Movable where False):\n";
-  for (auto &[name, type] : variables) {
-    exprOS << llvm::formatv("  @__allow_legacy_any_origin_fields\n"
-                            "  var `{0}`: "
-                            "__mojo_repl_UnsafePointer[mut=True, "
-                            "__mojo_repl_UnsafePointer[mut=True, {1}, "
-                            "MutAnyOrigin], MutAnyOrigin]\n",
-                            name, getPersistentVariableTypeName(name));
+  for (auto [index, variable] : llvm::enumerate(variables)) {
+    StringRef name = variable.first;
+    exprOS << "  @__allow_legacy_any_origin_fields\n"
+              "  var `"
+           << name << "`: __mojo_repl_UnsafePointer[mut=True, ";
+    if (index >= numProgramVariables)
+      exprOS << "__mojo_repl_UnsafePointer[mut=True, ";
+    exprOS << getPersistentVariableTypeName(name) << ", MutAnyOrigin]";
+    if (index >= numProgramVariables)
+      exprOS << ", MutAnyOrigin]";
+    exprOS << "\n";
   }
   if (variables.empty())
     exprOS << "  pass\n";
@@ -446,8 +455,11 @@ wrapExpressionText(MojoParserContext::REPLLocMapper::ExprLocMapper &locMapper,
          << "(mut __mojo_repl_arg: __mojo_repl_context__):\n"
             "  try:\n"
             "    __mojo_repl_expr_impl__(__mojo_repl_arg";
-  for (auto &[name, type] : variables)
-    exprOS << formatv(", __mojo_repl_arg.`{0}`[][]", name);
+  for (auto [index, variable] : llvm::enumerate(variables)) {
+    exprOS << formatv(", __mojo_repl_arg.`{0}`[]", variable.first);
+    if (index >= numProgramVariables)
+      exprOS << "[]";
+  }
 
   exprOS << ")\n"
             "  except error:\n"
@@ -539,6 +551,7 @@ static void processVariablesForPersistence(MojoParserREPLListener &listener,
   auto checkInsertPersistentVar = [&](VarDeclOp varOp) -> MRValue {
     Type elementType = varOp.getType().getElementType();
     PointerType type = PointerType::get(elementType);
+    bool isResult = listener.isResultVariable(varOp.getName());
 
     // Check if the variable should be persisted.
     if (!listener.shouldPersistVariable(varOp.getNameAttr(), elementType))
@@ -548,7 +561,8 @@ static void processVariablesForPersistence(MojoParserREPLListener &listener,
     std::string newFieldName =
         ("__new_repl_var_" + varOp.getNameAttr().strref()).str();
     auto newField = LIT::StructFieldOp::create(
-        structBuilder, varOp->getLoc(), newFieldName, PointerType::get(type));
+        structBuilder, varOp->getLoc(), newFieldName,
+        isResult ? Type(type) : Type(PointerType::get(type)));
 
     // Materialize a reference to the variable within the function.
     ImplicitLocOpBuilder builder(varOp->getLoc(), varOp);
@@ -556,23 +570,24 @@ static void processVariablesForPersistence(MojoParserREPLListener &listener,
                                                  structValue, newField);
     Value fieldLoad = RefLoadOp::create(builder, varOp->getLoc(), fieldGep);
 
-    // TODO: Whenever we have globals, we should be able to use a global
-    // variable for the address and ensure it gets preserved. For now, we just
-    // malloc the memory.
-    SmallVector<TypedAttr> operands{
-        TypeParamAttr::get(elementType, anyRegTypeType), targetAttr};
-    // Compute the size of the type.
-    Value sizeOf = ParamConstantOp::create(
-        builder, ParamOperatorAttr::get(POC::GetSizeOf, operands));
-    // Compute the alignment of the type.
-    Value alignOf = ParamConstantOp::create(
-        builder, ParamOperatorAttr::get(POC::GetAlignOf, operands));
-    // Allocate an aligned blob for the variable.
-    Value mallocCast = POP::AlignedAllocOp::create(
-        builder, type, ArrayRef<Value>{alignOf, sizeOf});
-    POP::StoreOp::create(builder, mallocCast, fieldLoad);
+    // Expression results are written directly into storage supplied by
+    // Materializer::AddResultVariable. Persistent variables instead need a
+    // stable allocation whose pointer is returned through their
+    // pointer-to-pointer context field.
+    Value variableAddress = fieldLoad;
+    if (!isResult) {
+      SmallVector<TypedAttr> operands{
+          TypeParamAttr::get(elementType, anyRegTypeType), targetAttr};
+      Value sizeOf = ParamConstantOp::create(
+          builder, ParamOperatorAttr::get(POC::GetSizeOf, operands));
+      Value alignOf = ParamConstantOp::create(
+          builder, ParamOperatorAttr::get(POC::GetAlignOf, operands));
+      variableAddress = POP::AlignedAllocOp::create(
+          builder, type, ArrayRef<Value>{alignOf, sizeOf});
+      POP::StoreOp::create(builder, variableAddress, fieldLoad);
+    }
 
-    // Return a pointer to the new address of the variable.
+    // Return a reference to the address of the variable.
 
     // In order to use the pointer as a reference we force cast.
     // FIXME(references): switch AlignedAllocOp to use references
@@ -591,9 +606,9 @@ static void processVariablesForPersistence(MojoParserREPLListener &listener,
     //
     // Workaround this for now by using hacky RefFromPointerREPLOp.
     // NOTE: DO NOT ADOPT THIS ANYWHERE ELSE!
-    mallocCast = LIT::RefFromPointerREPLOp::create(
-        builder, varOp.getType(), mallocCast, varOp.getNameAttr());
-    return MRValue(mallocCast);
+    variableAddress = LIT::RefFromPointerREPLOp::create(
+        builder, varOp.getType(), variableAddress, varOp.getNameAttr());
+    return MRValue(variableAddress);
   };
 
   for (auto &[name, decl] : variables) {
@@ -734,18 +749,56 @@ static ASTDecl &buildREPLModule(const llvm::MemoryBuffer *sourceBuf,
   return decl;
 }
 
+/// Recover source-level builtin types from scalar storage types emitted in
+/// debug information. A raw !kgen.scalar type describes the variable's ABI but
+/// has no Mojo methods, so using it directly makes expressions such as `x + y`
+/// fail type checking. This only applies to program variables imported from a
+/// debugger frame; persistent REPL variables already carry source-level types.
+/// Keep this intentionally small until debug info carries a general source-type
+/// encoding for local variables.
+static Type recoverProgramVariableSourceType(Type type, ASTDecl &moduleDecl,
+                                             SharedState &sharedState) {
+  auto simdType = dyn_cast<KGEN::SIMDType>(type);
+  if (!simdType || simdType.getResolvedSize() != 1)
+    return type;
+
+  std::optional<KGEN::KGENDType> dtype = simdType.getResolvedDType();
+  if (!dtype)
+    return type;
+
+  StringRef builtinName;
+  if (dtype->isIndex())
+    builtinName = "Int";
+  else if (dtype->isUIndex())
+    builtinName = "UInt";
+  else if (dtype->isBool())
+    builtinName = "Bool";
+  else
+    return type;
+
+  ASTType sourceType =
+      sharedState.lookupBuiltinType(builtinName, moduleDecl, SMLoc());
+  return sourceType ? Type(sourceType) : type;
+}
+
 /// Build and resolve a REPL module for the given wrapped expression string.
 /// Returns the fully resolved REPL module decl.
 static ASTDecl &buildAndResolveREPLModule(
     const llvm::MemoryBuffer *sourceBuf, StringRef moduleName,
     SharedState &sharedState, MojoASTDeclRef prevReplExpr, bool parseForLSP,
-    ArrayRef<std::pair<StringRef, Type>> replVariables = {}) {
+    ArrayRef<std::pair<StringRef, Type>> replVariables = {},
+    unsigned numProgramVariables = 0) {
+  assert(numProgramVariables <= replVariables.size());
   ASTDecl &moduleDecl = buildREPLModule(sourceBuf, moduleName, sharedState);
 
   // Generate aliases for the types of any persistent variables. We do this
   // programmatically because we can't guarantee we can print the type in a way
   // that the mojo parser will accept.
-  for (auto [name, type] : replVariables) {
+  for (auto [index, variable] : llvm::enumerate(replVariables)) {
+    auto [name, type] = variable;
+    if (index < numProgramVariables)
+      type = recoverProgramVariableSourceType(type, moduleDecl, sharedState);
+
     // The persistent variable's type can contain emitted references to type
     // decls. We have to make sure to resolve them in the current context. We
     // can use the SharedState's type walker for this.
@@ -825,7 +878,8 @@ MojoParserContext::REPLLocMapper &MojoParserContext::getREPLLocMapper() {
 MojoParserContext::ParsedREPLExpr MojoParserContext::parseREPLExpression(
     MojoParserREPLListener &listener, unsigned exprFileId,
     StringRef replExprFnName,
-    ArrayRef<std::pair<StringRef, Type>> replVariables) {
+    ArrayRef<std::pair<StringRef, Type>> replVariables,
+    unsigned numProgramVariables) {
   MojoASTDeclRef prevReplExpr;
   if (!impl->replModuleDecls.empty())
     prevReplExpr = impl->replModuleDecls.back();
@@ -834,14 +888,15 @@ MojoParserContext::ParsedREPLExpr MojoParserContext::parseREPLExpression(
   const llvm::MemoryBuffer *exprFileBuf = sourceMgr.getMemoryBuffer(exprFileId);
   return parseREPLExpression(listener, exprFileId, exprFileBuf->getBuffer(),
                              replExprFnName, replVariables, prevReplExpr,
-                             /*parseForLSP=*/false);
+                             /*parseForLSP=*/false, numProgramVariables);
 }
 
 MojoParserContext::ParsedREPLExpr MojoParserContext::parseREPLExpression(
     MojoParserREPLListener &listener, unsigned exprFileId, StringRef exprText,
     StringRef replExprFnName,
     ArrayRef<std::pair<StringRef, Type>> replVariables,
-    MojoASTDeclRef prevReplExpr, bool parseForLSP) {
+    MojoASTDeclRef prevReplExpr, bool parseForLSP,
+    unsigned numProgramVariables) {
   llvm::SourceMgr &sourceMgr = getSourceMgr();
   const llvm::MemoryBuffer *exprFileBuf = sourceMgr.getMemoryBuffer(exprFileId);
   assert(exprFileBuf->getBufferStart() <= exprText.data() &&
@@ -863,9 +918,9 @@ MojoParserContext::ParsedREPLExpr MojoParserContext::parseREPLExpression(
                                     sourceMgr);
 
   // Wrap the expression text in a function so that we can execute it.
-  std::string wrappedExprText =
-      wrapExpressionText(exprLocMapper, replExprFnName, exprText, replVariables,
-                         /*isFirstREPLCell=*/!prevReplExpr);
+  std::string wrappedExprText = wrapExpressionText(
+      exprLocMapper, replExprFnName, exprText, replVariables,
+      /*isFirstREPLCell=*/!prevReplExpr, numProgramVariables);
   listener.notifyWrappedExpr(wrappedExprText);
 
   // TODO: We should print the expression to a file if we need debug
@@ -888,9 +943,9 @@ MojoParserContext::ParsedREPLExpr MojoParserContext::parseREPLExpression(
   exprLocMapper.setWrappedExpr(sourceBuf->getBuffer());
 
   // Resolve a module decl for this REPL expression.
-  ASTDecl &moduleDecl =
-      buildAndResolveREPLModule(sourceBuf, replModuleName, impl->sharedState,
-                                prevReplExpr, parseForLSP, replVariables);
+  ASTDecl &moduleDecl = buildAndResolveREPLModule(
+      sourceBuf, replModuleName, impl->sharedState, prevReplExpr, parseForLSP,
+      replVariables, numProgramVariables);
   if (prevReplExpr)
     impl->prevReplModuleDecls.insert({&moduleDecl, &*prevReplExpr});
 
@@ -983,7 +1038,8 @@ static std::string prepareCompletionExpr(
 
   std::string wrappedExprText =
       wrapExpressionText(locMapper, "__mojo_repl_code_complete_fn",
-                         exprTextWithMarker, variables, isFirstCell);
+                         exprTextWithMarker, variables, isFirstCell,
+                         /*numProgramVariables=*/0);
 
   completionPosition = wrappedExprText.find(kCompletionMarker);
   wrappedExprText.erase(completionPosition, kCompletionMarker.size());
