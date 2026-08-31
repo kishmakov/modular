@@ -101,6 +101,25 @@
 # SEQ: (Int) $R2 = 41
 # SEQ: (Int) $R3 = 7
 
+# COM: Frame inputs are selected by a structural discovery parse. A local
+# COM: declaration shadows a same-named frame variable, while another free
+# COM: reference is still imported. Identifier-like text in comments and
+# COM: strings does not create a frame input.
+# RUN: %debug \
+# RUN:   -X -b \
+# RUN:   -X -o -X 'b expression.mojo:42' \
+# RUN:   -X -o -X 'run' \
+# RUN:   -X -o -X 'expression --language mojo -- var lhs = 1; lhs' \
+# RUN:   -X -o -X 'expression --language mojo -- var lhs = 1; lhs + rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- 1 + 2  # lhs + rhs' \
+# RUN:   -X -o -X 'expression --language mojo -- String("lhs + rhs")' \
+# RUN:   '%S/Inputs/expression.mojo' | FileCheck --check-prefix=DISCOVERY %s
+
+# DISCOVERY: (Int) $R0 = 1
+# DISCOVERY: (Int) $R1 = 23
+# DISCOVERY: (Int) $R2 = 3
+# DISCOVERY: (String) $R3 = "lhs + rhs"
+
 # COM: When more than one statement leaves its value unused, the parser emits
 # COM: a fix-it for each. Only the last becomes the result; the earlier ones
 # COM: keep the `_ = ` discard. That combined rewrite is no longer purely
