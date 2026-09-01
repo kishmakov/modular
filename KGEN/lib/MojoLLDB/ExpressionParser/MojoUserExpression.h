@@ -20,6 +20,7 @@
 #include "lldb/Expression/LLVMUserExpression.h"
 
 namespace M::KGEN::Mojo {
+class MojoExpressionParser;
 class MojoPersistentExpressionState;
 class MojoTypeSystem;
 
@@ -79,9 +80,18 @@ public:
   static bool classof(const Expression *obj) { return obj->isA(&ID); }
 
 private:
+  friend class MojoExpressionParser;
+
   //===--------------------------------------------------------------------===//
   // Expression parsing and execution
   //===--------------------------------------------------------------------===//
+
+  /// Add storage for a persistent variable produced by this expression to its
+  /// materializer. `isResult` marks the one variable LLDB reports as the
+  /// expression's result; it is routed to the result delegate when
+  /// dematerialized, which is what `GetResultAfterDematerialization` returns.
+  void addPersistentVariable(lldb::ExpressionVariableSP &variable,
+                             bool isResult, lldb_private::Status &error);
 
   /// Add the function arguments used when invoking the wrapper function for the
   /// generated expression.
