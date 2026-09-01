@@ -161,14 +161,20 @@ public:
     return isError ? "$E" : "$R";
   }
 
+  /// Return true if `name` is one of LLDB's own persistent variable names:
+  /// `$R<n>` for a result, `$E<n>` for an error. Neither is a Mojo identifier,
+  /// so such a variable cannot be named by a later expression.
+  bool isPersistentVariableName(StringRef name) const {
+    return name.starts_with(GetPersistentVariablePrefix(/*isError=*/false)) ||
+           name.starts_with(GetPersistentVariablePrefix(/*isError=*/true));
+  }
+
   void RemovePersistentVariable(lldb::ExpressionVariableSP variable) override {
     RemoveVariable(variable);
   }
 
   lldb_private::ConstString
-  GetNextPersistentVariableName(bool isError = false) override {
-    return lldb_private::ConstString("");
-  }
+  GetNextPersistentVariableName(bool isError = false) override;
 
   std::optional<lldb_private::CompilerType> GetCompilerTypeFromPersistentDecl(
       lldb_private::ConstString typeName) override {
@@ -200,6 +206,9 @@ private:
 
   /// The next identifier to use when building a python expression module.
   size_t nextPythonModuleID = 0;
+
+  /// The next identifier to use for an LLDB expression result.
+  size_t nextPersistentVariableID = 0;
 };
 } // namespace M::KGEN::Mojo
 

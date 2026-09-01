@@ -158,6 +158,13 @@ lldb::addr_t MojoPersistentExpressionState::LookupSymbol(ConstString name) {
   return PersistentExpressionState::LookupSymbol(name);
 }
 
+ConstString
+MojoPersistentExpressionState::GetNextPersistentVariableName(bool isError) {
+  return ConstString((Twine(GetPersistentVariablePrefix(isError)) +
+                      Twine(nextPersistentVariableID++))
+                         .str());
+}
+
 void MojoPersistentExpressionState::collectPersistentVariables(
     SmallVectorImpl<std::pair<StringRef, Type>> &variables) {
   DenseSet<ConstString> persistentVariableNames;
@@ -167,12 +174,19 @@ void MojoPersistentExpressionState::collectPersistentVariables(
     if (!persistentVariableNames.insert(var->GetName()).second)
       continue;
 
-    // All persistent variable types are wrapped in a reference type, so unwrap
-    // the types before adding them to the current expression.
-    auto ptrType = cast<LIT::REPLResultRefType>(
-        Type::getFromOpaquePointer(var->GetCompilerType().GetOpaqueQualType()));
+    // Skip results, which are published under LLDB's own `$R`/`$E` name.
+    if (isPersistentVariableName(var->GetName().GetStringRef()))
+      continue;
 
-    Type varType = ptrType.getElementType();
-    variables.emplace_back(var->GetName().GetStringRef(), varType);
+    Type type =
+        Type::getFromOpaquePointer(var->GetCompilerType().GetOpaqueQualType());
+    // Only REPL variables use this reference wrapper and can be passed into a
+    // subsequent Mojo expression.
+    auto ptrType = dyn_cast<LIT::REPLResultRefType>(type);
+    if (!ptrType)
+      continue;
+
+    variables.emplace_back(var->GetName().GetStringRef(),
+                           ptrType.getElementType());
   }
 }

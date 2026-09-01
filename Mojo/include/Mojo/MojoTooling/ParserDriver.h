@@ -296,10 +296,16 @@ public:
   ///   def replExprFn(context&: ReplContext):
   ///      print(context.a.load().load())
   ///
+  /// `frameVariables` is a list of variables from a debugger frame. The
+  /// caller supplies their addresses directly, so they are passed as
+  /// `Pointer[T]` fields rather than the `Pointer[Pointer[T]]` layout shown
+  /// above.
+  ///
   ParsedREPLExpr
   parseREPLExpression(MojoParserREPLListener &listener, unsigned exprFileId,
                       StringRef replExprFnName,
-                      ArrayRef<std::pair<StringRef, Type>> replVariables);
+                      ArrayRef<std::pair<StringRef, Type>> replVariables,
+                      ArrayRef<std::pair<StringRef, Type>> frameVariables);
 
   /// The following methods allow for interacting with the parser for REPL
   /// like expressions, i.e., in environments like Jupyter notebooks.
@@ -318,6 +324,7 @@ public:
   parseREPLExpression(MojoParserREPLListener &listener, unsigned exprFileId,
                       StringRef exprText, StringRef replExprFnName,
                       ArrayRef<std::pair<StringRef, Type>> replVariables,
+                      ArrayRef<std::pair<StringRef, Type>> frameVariables,
                       ASTDecl *prevReplExpr, bool parseForLSP);
 
   /// Return the code completion results for the given REPL expression.
